@@ -9,8 +9,17 @@
   "use strict";
 
   var TOAST_MS = 6000;
-  var RECENT_MAX = 5;
-  var RECENT_KEY = "recentCategories";
+  // ---- Top 5 tuning ----
+  // Each time you add a category, every score is multiplied by DECAY and the
+  // chosen one gets +1. A pick is worth half as much after ~14 later picks.
+  var TOP_N = 5;
+  var DECAY = 0.95;
+  // A newcomer must beat the weakest Top 5 member by this much to replace it,
+  // so two close categories don't keep swapping places.
+  var MARGIN = 0.5;
+  var MIN_SCORE = 0.01; // scores below this are forgotten
+  var TOP_KEY = "topCategories";
+  var OLD_RECENT_KEY = "recentCategories"; // from the earlier "Recent" version
 
   // Outlook's category colour presets.
   var COLORS = {
@@ -28,8 +37,14 @@
     mock: false,
     masterCategories: [],
     itemCategories: new Set(),
-    recent: [] // category names, most recently chosen first
+    scores: {}, // category name -> weighted score
+    top: []     // names currently in the Top 5
   };
+
+  function compareNames(a, b) {
+    // Alphabetical, ignoring case; numbers sort naturally ("2" before "10").
+    return a.localeCompare(b, undefined, { sensitivity: "base", numeric: true });
+  }
 
   function $(id) { return document.getElementById(id); }
 
@@ -71,15 +86,26 @@
     removeCategory: function (name) {
       return officeAsync(function (cb) { Office.context.mailbox.item.categories.removeAsync([name], cb); });
     },
-    // Roaming settings are stored in your mailbox, so Recent follows you
+    // Roaming settings are stored in your mailbox, so Top 5 follows you
     // between new Outlook on desktop and Outlook on the web.
-    loadRecent: function () {
-      var v = Office.context.roamingSettings.get(RECENT_KEY);
-      return Array.isArray(v) ? v : [];
+    loadTop: function () {
+      var rs = Office.context.roamingSettings;
+      var v = rs.get(TOP_KEY);
+      if (v && typeof v === "object" && v.scores) return v;
+      // First run after the upgrade: seed scores from the old Recent list
+      // (small values, so real usage quickly takes over).
+      var old = rs.get(OLD_RECENT_KEY);
+      var scores = {};
+      if (Array.isArray(old)) {
+        old.slice(0, TOP_N).forEach(function (n, i) { scores[n] = Math.pow(DECAY, i); });
+      }
+      return { scores: scores, top: [] };
     },
-    saveRecent: function (list) {
-      Office.context.roamingSettings.set(RECENT_KEY, list);
-      Office.context.roamingSettings.saveAsync();
+    saveTop: function (data) {
+      var rs = Office.context.roamingSettings;
+      rs.set(TOP_KEY, data);
+      rs.remove(OLD_RECENT_KEY);
+      rs.saveAsync();
     }
   };
 
@@ -102,8 +128,10 @@
     },
     addCategory: async function (n) { await delay(120); mockItemCats.add(n); },
     removeCategory: async function (n) { await delay(120); mockItemCats.delete(n); },
-    loadRecent: function () { return ["Follow up", "Travel"]; },
-    saveRecent: function () { /* preview: not persisted */ }
+    loadTop: function () {
+      return { scores: { "Follow up": 3.2, "Travel": 2.1, "Finance": 1.4 }, top: [] };
+    },
+    saveTop: function () { /* preview: not persisted */ }
   };
 
   var api = real;
@@ -135,17 +163,17 @@
   function renderCategories() {
     var hasItem = api.hasItem();
 
-    // Recent: up to 5, most recently chosen first, skipping any that no longer exist.
+    // Top 5: shown alphabetically so positions stay put as scores shift.
     var byName = {};
     state.masterCategories.forEach(function (c) { byName[c.displayName] = c; });
-    var recent = state.recent
+    var top = state.top
       .filter(function (n) { return byName[n]; })
-      .slice(0, RECENT_MAX)
+      .sort(compareNames)
       .map(function (n) { return byName[n]; });
-    var recentWrap = $("recent");
-    recentWrap.textContent = "";
-    recent.forEach(function (c) { recentWrap.appendChild(categoryButton(c, hasItem)); });
-    $("recent-section").hidden = recent.length === 0;
+    var topWrap = $("recent");
+    topWrap.textContent = "";
+    top.forEach(function (c) { topWrap.appendChild(categoryButton(c, hasItem)); });
+    $("recent-section").hidden = top.length === 0;
 
     // All: every category, alphabetical.
     var wrap = $("categories");
@@ -154,10 +182,53 @@
     $("cat-empty").hidden = state.masterCategories.length > 0;
   }
 
-  function rememberRecent(name) {
-    state.recent = [name].concat(state.recent.filter(function (n) { return n !== name; }))
-      .slice(0, RECENT_MAX * 2); // keep a few spares in case some categories get deleted
-    try { api.saveRecent(state.recent); } catch (e) { /* not critical */ }
+  // Works out the Top 5 from the scores. Existing members keep their spot
+  // unless a newcomer beats the weakest member by MARGIN.
+  // Returns true if the membership changed.
+  function recomputeTop() {
+    var exists = {};
+    state.masterCategories.forEach(function (c) { exists[c.displayName] = true; });
+    var score = function (n) { return state.scores[n] || 0; };
+
+    var members = state.top.filter(function (n) { return exists[n] && score(n) > 0; });
+    var others = Object.keys(state.scores)
+      .filter(function (n) { return exists[n] && members.indexOf(n) === -1 && score(n) > 0; })
+      .sort(function (a, b) { return score(b) - score(a); });
+
+    // Fill empty slots with the highest scorers.
+    while (members.length < TOP_N && others.length) members.push(others.shift());
+
+    // Let a clearly stronger newcomer replace the weakest member.
+    while (others.length) {
+      var weakest = members.reduce(function (w, n) { return score(n) < score(w) ? n : w; }, members[0]);
+      if (score(others[0]) > score(weakest) + MARGIN) {
+        members[members.indexOf(weakest)] = others.shift();
+        others.push(weakest);
+        others.sort(function (a, b) { return score(b) - score(a); });
+      } else {
+        break;
+      }
+    }
+
+    var changed = members.slice().sort().join("\n") !== state.top.slice().sort().join("\n");
+    state.top = members;
+    return changed;
+  }
+
+  function saveTop() {
+    try { api.saveTop({ scores: state.scores, top: state.top }); } catch (e) { /* not critical */ }
+  }
+
+  function recordPick(name) {
+    var next = {};
+    Object.keys(state.scores).forEach(function (n) {
+      var s = state.scores[n] * DECAY;
+      if (s >= MIN_SCORE) next[n] = Math.round(s * 1000) / 1000;
+    });
+    next[name] = Math.round(((next[name] || 0) + 1) * 1000) / 1000;
+    state.scores = next;
+    recomputeTop();
+    saveTop();
   }
 
   var toastTimer = null;
@@ -173,9 +244,10 @@
   async function loadCategories() {
     try {
       state.masterCategories = ((await api.masterCategories()) || []).slice().sort(function (a, b) {
-        // Alphabetical, ignoring case; numbers sort naturally ("2" before "10").
-        return a.displayName.localeCompare(b.displayName, undefined, { sensitivity: "base", numeric: true });
+        return compareNames(a.displayName, b.displayName);
       });
+      // Fill free slots / drop deleted categories from the Top 5.
+      if (recomputeTop()) saveTop();
     } catch (e) {
       state.masterCategories = [];
       toast("Couldn't load categories: " + e.message);
@@ -205,7 +277,7 @@
         await api.removeCategory(name);
       } else {
         await api.addCategory(name);
-        rememberRecent(name);
+        recordPick(name);
         renderCategories();
       }
     } catch (e) {
@@ -234,7 +306,11 @@
     document.addEventListener("mousedown", function (e) {
       if (e.button === 0 && e.target.closest && e.target.closest("button")) e.preventDefault();
     }, true);
-    try { state.recent = api.loadRecent(); } catch (e) { state.recent = []; }
+    try {
+      var saved = api.loadTop();
+      state.scores = saved.scores || {};
+      state.top = Array.isArray(saved.top) ? saved.top : [];
+    } catch (e) { state.scores = {}; state.top = []; }
 
     renderItem();
     await loadCategories();
