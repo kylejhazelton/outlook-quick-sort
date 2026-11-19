@@ -135,7 +135,10 @@
 
   async function loadCategories() {
     try {
-      state.masterCategories = (await api.masterCategories()) || [];
+      state.masterCategories = ((await api.masterCategories()) || []).slice().sort(function (a, b) {
+        // Alphabetical, ignoring case; numbers sort naturally ("2" before "10").
+        return a.displayName.localeCompare(b.displayName, undefined, { sensitivity: "base", numeric: true });
+      });
     } catch (e) {
       state.masterCategories = [];
       toast("Couldn't load categories: " + e.message);
