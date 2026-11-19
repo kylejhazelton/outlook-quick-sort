@@ -9,6 +9,8 @@
   "use strict";
 
   var TOAST_MS = 6000;
+  var RECENT_MAX = 5;
+  var RECENT_KEY = "recentCategories";
 
   // Outlook's category colour presets.
   var COLORS = {
@@ -25,7 +27,8 @@
   var state = {
     mock: false,
     masterCategories: [],
-    itemCategories: new Set()
+    itemCategories: new Set(),
+    recent: [] // category names, most recently chosen first
   };
 
   function $(id) { return document.getElementById(id); }
@@ -67,6 +70,16 @@
     },
     removeCategory: function (name) {
       return officeAsync(function (cb) { Office.context.mailbox.item.categories.removeAsync([name], cb); });
+    },
+    // Roaming settings are stored in your mailbox, so Recent follows you
+    // between new Outlook on desktop and Outlook on the web.
+    loadRecent: function () {
+      var v = Office.context.roamingSettings.get(RECENT_KEY);
+      return Array.isArray(v) ? v : [];
+    },
+    saveRecent: function (list) {
+      Office.context.roamingSettings.set(RECENT_KEY, list);
+      Office.context.roamingSettings.saveAsync();
     }
   };
 
@@ -88,7 +101,9 @@
       return Array.from(mockItemCats).map(function (n) { return { displayName: n }; });
     },
     addCategory: async function (n) { await delay(120); mockItemCats.add(n); },
-    removeCategory: async function (n) { await delay(120); mockItemCats.delete(n); }
+    removeCategory: async function (n) { await delay(120); mockItemCats.delete(n); },
+    loadRecent: function () { return ["Follow up", "Travel"]; },
+    saveRecent: function () { /* preview: not persisted */ }
   };
 
   var api = real;
@@ -101,26 +116,48 @@
     $("subject").title = subject || "";
   }
 
+  function categoryButton(c, hasItem) {
+    var on = state.itemCategories.has(c.displayName);
+    var b = el("button", "chip");
+    b.type = "button";
+    b.setAttribute("aria-pressed", on ? "true" : "false");
+    b.title = (on ? "Remove " : "Add ") + c.displayName;
+    b.disabled = !hasItem;
+    var dot = el("span", "dot");
+    dot.style.setProperty("--c", COLORS[c.color] || COLORS.None);
+    b.appendChild(dot);
+    b.appendChild(el("span", "label", c.displayName));
+    b.appendChild(el("span", "check", on ? "✓" : ""));
+    b.addEventListener("click", function () { toggleCategory(c.displayName); });
+    return b;
+  }
+
   function renderCategories() {
+    var hasItem = api.hasItem();
+
+    // Recent: up to 5, most recently chosen first, skipping any that no longer exist.
+    var byName = {};
+    state.masterCategories.forEach(function (c) { byName[c.displayName] = c; });
+    var recent = state.recent
+      .filter(function (n) { return byName[n]; })
+      .slice(0, RECENT_MAX)
+      .map(function (n) { return byName[n]; });
+    var recentWrap = $("recent");
+    recentWrap.textContent = "";
+    recent.forEach(function (c) { recentWrap.appendChild(categoryButton(c, hasItem)); });
+    $("recent-section").hidden = recent.length === 0;
+
+    // All: every category, alphabetical.
     var wrap = $("categories");
     wrap.textContent = "";
-    var hasItem = api.hasItem();
-    state.masterCategories.forEach(function (c) {
-      var on = state.itemCategories.has(c.displayName);
-      var b = el("button", "chip");
-      b.type = "button";
-      b.setAttribute("aria-pressed", on ? "true" : "false");
-      b.title = (on ? "Remove " : "Add ") + c.displayName;
-      b.disabled = !hasItem;
-      var dot = el("span", "dot");
-      dot.style.setProperty("--c", COLORS[c.color] || COLORS.None);
-      b.appendChild(dot);
-      b.appendChild(el("span", "label", c.displayName));
-      b.appendChild(el("span", "check", on ? "✓" : ""));
-      b.addEventListener("click", function () { toggleCategory(c.displayName); });
-      wrap.appendChild(b);
-    });
+    state.masterCategories.forEach(function (c) { wrap.appendChild(categoryButton(c, hasItem)); });
     $("cat-empty").hidden = state.masterCategories.length > 0;
+  }
+
+  function rememberRecent(name) {
+    state.recent = [name].concat(state.recent.filter(function (n) { return n !== name; }))
+      .slice(0, RECENT_MAX * 2); // keep a few spares in case some categories get deleted
+    try { api.saveRecent(state.recent); } catch (e) { /* not critical */ }
   }
 
   var toastTimer = null;
@@ -164,7 +201,13 @@
     if (had) state.itemCategories.delete(name); else state.itemCategories.add(name);
     renderCategories();
     try {
-      if (had) await api.removeCategory(name); else await api.addCategory(name);
+      if (had) {
+        await api.removeCategory(name);
+      } else {
+        await api.addCategory(name);
+        rememberRecent(name);
+        renderCategories();
+      }
     } catch (e) {
       if (had) state.itemCategories.add(name); else state.itemCategories.delete(name);
       renderCategories();
@@ -184,6 +227,7 @@
     api = state.mock ? mock : real;
     $("mode").hidden = !state.mock;
     $("refresh").addEventListener("click", loadCategories);
+    try { state.recent = api.loadRecent(); } catch (e) { state.recent = []; }
 
     renderItem();
     await loadCategories();

@@ -13,12 +13,19 @@
     <div id="mode" class="mode" hidden>Preview mode: sample data</div>
   </header>
 
+  <section id="recent-section" hidden>
+    <div class="section-head">
+      <h2>Recent</h2>
+    </div>
+    <div id="recent" class="chips" role="group" aria-label="Recent categories"></div>
+  </section>
+
   <section>
     <div class="section-head">
-      <h2>Categories</h2>
+      <h2>All</h2>
       <button id="refresh" class="icon-btn" title="Reload categories" aria-label="Reload categories">&#x21bb;</button>
     </div>
-    <div id="categories" class="chips" role="group" aria-label="Categories"></div>
+    <div id="categories" class="chips" role="group" aria-label="All categories"></div>
     <p id="cat-empty" class="muted" hidden>No categories in your mailbox yet. Create some in Outlook, then click &#x21bb;.</p>
   </section>
 
