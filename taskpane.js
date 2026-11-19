@@ -227,6 +227,13 @@
     api = state.mock ? mock : real;
     $("mode").hidden = !state.mock;
     $("refresh").addEventListener("click", loadCategories);
+
+    // Keep keyboard focus in Outlook's message list: cancelling mousedown on a
+    // button stops the click from moving focus into this panel, while the click
+    // itself still fires. (Tab-key navigation into the panel still works.)
+    document.addEventListener("mousedown", function (e) {
+      if (e.button === 0 && e.target.closest && e.target.closest("button")) e.preventDefault();
+    }, true);
     try { state.recent = api.loadRecent(); } catch (e) { state.recent = []; }
 
     renderItem();
