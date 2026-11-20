@@ -1,9 +1,13 @@
 /*
  * Quick Sort: one-click categories for Outlook.
  *
- * Uses only Office.js (Mailbox 1.8), so no sign-in or app registration is needed.
+ * Uses only Office.js, so no sign-in or app registration is needed.
+ *  - One email selected: Mailbox 1.8 category APIs on the open item.
+ *  - Several selected:   Mailbox 1.15 loadItemByIdAsync, one email at a time
+ *                        (Outlook only allows one loaded item at once).
+ *
  * Opened outside Outlook (e.g. straight in a browser), it runs in preview mode
- * with sample data so you can check the layout.
+ * with sample data. Add ?multi=4 to the URL to preview a 4-email selection.
  */
 (function () {
   "use strict";
@@ -11,7 +15,7 @@
   var TOAST_MS = 6000;
   // ---- Top 5 tuning ----
   // Each time you add a category, every score is multiplied by DECAY and the
-  // chosen one gets +1. A pick is worth half as much after ~14 later picks.
+  // chosen one gets +1 per email it was applied to (+12 for 12 selected emails).
   var TOP_N = 5;
   var DECAY = 0.95;
   // A newcomer must beat the weakest Top 5 member by this much to replace it,
@@ -36,10 +40,16 @@
   var state = {
     mock: false,
     masterCategories: [],
-    itemCategories: new Set(),
-    scores: {}, // category name -> weighted score
-    top: []     // names currently in the Top 5
+    itemCategories: new Set(), // single-email mode
+    // Multi-email mode (null when one email is selected):
+    //   { items: [{id, subject}], cats: {id: Set}, ready: bool }
+    multi: null,
+    busy: false,               // applying to several emails
+    status: "",                // progress text under the header
+    scores: {},                // category name -> weighted score
+    top: []                    // names currently in the Top 5
   };
+  var selectionGen = 0; // bumps on every selection change, to drop stale work
 
   function compareNames(a, b) {
     // Alphabetical, ignoring case; numbers sort naturally ("2" before "10").
@@ -66,6 +76,19 @@
     });
   }
 
+  function names(cats) {
+    return new Set((cats || []).map(function (c) { return c.displayName; }));
+  }
+
+  // Outlook allows only one loaded item at a time, so every loaded-item
+  // operation goes through this queue.
+  var loadQueue = Promise.resolve();
+  function queued(task) {
+    var run = loadQueue.then(task);
+    loadQueue = run.catch(function () {});
+    return run;
+  }
+
   // ---------- mailbox adapters (real Outlook vs. preview) ----------
 
   var real = {
@@ -86,6 +109,32 @@
     removeCategory: function (name) {
       return officeAsync(function (cb) { Office.context.mailbox.item.categories.removeAsync([name], cb); });
     },
+
+    supportsMulti: function () {
+      return Office.context.requirements.isSetSupported("Mailbox", "1.15");
+    },
+    selectedItems: function () {
+      return officeAsync(function (cb) { Office.context.mailbox.getSelectedItemsAsync(cb); })
+        .then(function (list) {
+          return (list || []).map(function (s) { return { id: s.itemId, subject: s.subject }; });
+        });
+    },
+    // Loads one selected email, runs fn(ops), then unloads it.
+    withItem: function (id, fn) {
+      return queued(async function () {
+        var item = await officeAsync(function (cb) { Office.context.mailbox.loadItemByIdAsync(id, cb); });
+        try {
+          return await fn({
+            categories: function () { return officeAsync(function (cb) { item.categories.getAsync(cb); }); },
+            add: function (n) { return officeAsync(function (cb) { item.categories.addAsync([n], cb); }); },
+            remove: function (n) { return officeAsync(function (cb) { item.categories.removeAsync([n], cb); }); }
+          });
+        } finally {
+          await new Promise(function (r) { item.unloadAsync(function () { r(); }); });
+        }
+      });
+    },
+
     // Roaming settings are stored in your mailbox, so Top 5 follows you
     // between new Outlook on desktop and Outlook on the web.
     loadTop: function () {
@@ -109,10 +158,20 @@
     }
   };
 
-  var mockItemCats = new Set(["Follow up"]);
+  // ---- preview mode ----
+  var mockMultiCount = (function () {
+    var m = /[?&]multi=(\d+)/.exec(location.search);
+    return m ? Math.min(100, parseInt(m[1], 10)) : 0;
+  })();
+  var mockStore = {}; // id -> Set of categories
+  var mockSubjects = ["Q3 budget review: notes from Tuesday", "Site visit photos", "Invoice #4471",
+    "Re: Lunch Friday?", "Updated drawings", "Travel itinerary"];
+  for (var i = 0; i < Math.max(1, mockMultiCount); i++) {
+    mockStore["mock-" + i] = new Set(i % 2 === 0 ? ["Follow up"] : ["Follow up", "Finance"]);
+  }
   var mock = {
-    hasItem: function () { return true; },
-    subject: function () { return "Q3 budget review: notes from Tuesday"; },
+    hasItem: function () { return mockMultiCount < 2; },
+    subject: function () { return mockMultiCount < 2 ? mockSubjects[0] : null; },
     masterCategories: async function () {
       return [
         { displayName: "Follow up", color: "Preset0" },
@@ -124,10 +183,29 @@
       ];
     },
     itemCategories: async function () {
-      return Array.from(mockItemCats).map(function (n) { return { displayName: n }; });
+      return Array.from(mockStore["mock-0"]).map(function (n) { return { displayName: n }; });
     },
-    addCategory: async function (n) { await delay(120); mockItemCats.add(n); },
-    removeCategory: async function (n) { await delay(120); mockItemCats.delete(n); },
+    addCategory: async function (n) { await delay(120); mockStore["mock-0"].add(n); },
+    removeCategory: async function (n) { await delay(120); mockStore["mock-0"].delete(n); },
+    supportsMulti: function () { return true; },
+    selectedItems: async function () {
+      return Object.keys(mockStore).map(function (id, i) {
+        return { id: id, subject: mockSubjects[i % mockSubjects.length] };
+      });
+    },
+    withItem: function (id, fn) {
+      return queued(async function () {
+        await delay(60);
+        var set = mockStore[id];
+        return fn({
+          categories: async function () {
+            return Array.from(set).map(function (n) { return { displayName: n }; });
+          },
+          add: async function (n) { await delay(60); set.add(n); },
+          remove: async function (n) { await delay(60); set.delete(n); }
+        });
+      });
+    },
     loadTop: function () {
       return { scores: { "Follow up": 3.2, "Travel": 2.1, "Finance": 1.4 }, top: [] };
     },
@@ -138,30 +216,55 @@
 
   // ---------- rendering ----------
 
-  function renderItem() {
-    var subject = api.subject();
-    $("subject").textContent = subject || "No message selected";
-    $("subject").title = subject || "";
+  function renderHeader() {
+    var text;
+    if (state.multi) {
+      var n = state.multi.items.length;
+      text = n === 1 ? (state.multi.items[0].subject || "(no subject)") : n + " emails selected";
+    } else {
+      text = api.subject() || "No message selected";
+    }
+    $("subject").textContent = text;
+    $("subject").title = text;
+    $("status").textContent = state.status;
+    $("status").hidden = !state.status;
   }
 
-  function categoryButton(c, hasItem) {
-    var on = state.itemCategories.has(c.displayName);
+  // "on" = every selected email has it, "mixed" = some do, "off" = none.
+  function categoryState(name) {
+    if (!state.multi) return state.itemCategories.has(name) ? "on" : "off";
+    var ids = Object.keys(state.multi.cats);
+    var count = ids.filter(function (id) { return state.multi.cats[id].has(name); }).length;
+    if (count === 0) return "off";
+    // Compare against the emails read so far, so nothing looks "mixed" mid-read.
+    return count === ids.length ? "on" : "mixed";
+  }
+
+  function canAct() {
+    if (state.busy) return false;
+    if (state.multi) return state.multi.ready;
+    return api.hasItem();
+  }
+
+  function categoryButton(c, enabled) {
+    var st = categoryState(c.displayName);
     var b = el("button", "chip");
     b.type = "button";
-    b.setAttribute("aria-pressed", on ? "true" : "false");
-    b.title = (on ? "Remove " : "Add ") + c.displayName;
-    b.disabled = !hasItem;
+    b.setAttribute("aria-pressed", st === "on" ? "true" : st === "mixed" ? "mixed" : "false");
+    b.title = (st === "on" ? "Remove " : "Add ") + c.displayName;
+    b.disabled = !enabled;
     var dot = el("span", "dot");
     dot.style.setProperty("--c", COLORS[c.color] || COLORS.None);
     b.appendChild(dot);
     b.appendChild(el("span", "label", c.displayName));
-    b.appendChild(el("span", "check", on ? "✓" : ""));
+    b.appendChild(el("span", "check", st === "on" ? "✓" : st === "mixed" ? "–" : ""));
     b.addEventListener("click", function () { toggleCategory(c.displayName); });
     return b;
   }
 
   function renderCategories() {
-    var hasItem = api.hasItem();
+    renderHeader();
+    var enabled = canAct();
 
     // Top 5: shown alphabetically so positions stay put as scores shift.
     var byName = {};
@@ -172,15 +275,17 @@
       .map(function (n) { return byName[n]; });
     var topWrap = $("recent");
     topWrap.textContent = "";
-    top.forEach(function (c) { topWrap.appendChild(categoryButton(c, hasItem)); });
+    top.forEach(function (c) { topWrap.appendChild(categoryButton(c, enabled)); });
     $("recent-section").hidden = top.length === 0;
 
     // All: every category, alphabetical.
     var wrap = $("categories");
     wrap.textContent = "";
-    state.masterCategories.forEach(function (c) { wrap.appendChild(categoryButton(c, hasItem)); });
+    state.masterCategories.forEach(function (c) { wrap.appendChild(categoryButton(c, enabled)); });
     $("cat-empty").hidden = state.masterCategories.length > 0;
   }
+
+  // ---------- Top 5 scoring ----------
 
   // Works out the Top 5 from the scores. Existing members keep their spot
   // unless a newcomer beats the weakest member by MARGIN.
@@ -219,13 +324,15 @@
     try { api.saveTop({ scores: state.scores, top: state.top }); } catch (e) { /* not critical */ }
   }
 
-  function recordPick(name) {
+  // One pick event: everything fades once, the chosen category gets +weight
+  // (weight = number of selected emails).
+  function recordPick(name, weight) {
     var next = {};
     Object.keys(state.scores).forEach(function (n) {
       var s = state.scores[n] * DECAY;
       if (s >= MIN_SCORE) next[n] = Math.round(s * 1000) / 1000;
     });
-    next[name] = Math.round(((next[name] || 0) + 1) * 1000) / 1000;
+    next[name] = Math.round(((next[name] || 0) + (weight || 1)) * 1000) / 1000;
     state.scores = next;
     recomputeTop();
     saveTop();
@@ -239,7 +346,7 @@
     toastTimer = setTimeout(function () { $("toast").hidden = true; }, TOAST_MS);
   }
 
-  // ---------- actions ----------
+  // ---------- selection ----------
 
   async function loadCategories() {
     try {
@@ -252,22 +359,55 @@
       state.masterCategories = [];
       toast("Couldn't load categories: " + e.message);
     }
-    await loadItemCategories();
-  }
-
-  async function loadItemCategories() {
-    state.itemCategories = new Set();
-    if (api.hasItem()) {
-      try {
-        var cats = (await api.itemCategories()) || [];
-        cats.forEach(function (c) { state.itemCategories.add(c.displayName); });
-      } catch (e) { /* item may have gone away */ }
-    }
     renderCategories();
   }
 
+  // Works out what's selected and loads its categories.
+  async function refreshSelection() {
+    var gen = ++selectionGen;
+    var selected = null;
+    if (api.supportsMulti()) {
+      try { selected = await api.selectedItems(); } catch (e) { selected = null; }
+      if (gen !== selectionGen) return;
+    }
+
+    var useMulti = selected && (selected.length > 1 || (selected.length === 1 && !api.hasItem()));
+    if (!useMulti) {
+      state.multi = null;
+      state.status = "";
+      state.itemCategories = new Set();
+      if (api.hasItem()) {
+        try { state.itemCategories = names(await api.itemCategories()); } catch (e) { /* item went away */ }
+      }
+      if (gen === selectionGen) renderCategories();
+      return;
+    }
+
+    var m = { items: selected, cats: {}, ready: false };
+    state.multi = m;
+    for (var i = 0; i < selected.length; i++) {
+      if (gen !== selectionGen) return; // selection changed: stop reading
+      state.status = selected.length > 3 ? "Reading " + (i + 1) + " of " + selected.length + "…" : "";
+      renderCategories();
+      var id = selected[i].id;
+      try {
+        m.cats[id] = names(await api.withItem(id, function (ops) { return ops.categories(); }));
+      } catch (e) {
+        m.cats[id] = new Set();
+      }
+    }
+    if (gen !== selectionGen) return;
+    m.ready = true;
+    state.status = "";
+    renderCategories();
+  }
+
+  // ---------- actions ----------
+
   async function toggleCategory(name) {
-    if (!api.hasItem()) return;
+    if (!canAct()) return;
+    if (state.multi) return toggleMulti(name);
+
     var had = state.itemCategories.has(name);
     // Optimistic update so the click feels instant; rolled back on failure.
     if (had) state.itemCategories.delete(name); else state.itemCategories.add(name);
@@ -277,7 +417,7 @@
         await api.removeCategory(name);
       } else {
         await api.addCategory(name);
-        recordPick(name);
+        recordPick(name, 1);
         renderCategories();
       }
     } catch (e) {
@@ -287,9 +427,44 @@
     }
   }
 
-  async function onItemChanged() {
-    renderItem();
-    await loadItemCategories();
+  // Several emails: if all have it, remove it from all; otherwise add it to
+  // the ones that don't.
+  async function toggleMulti(name) {
+    var m = state.multi;
+    var total = m.items.length;
+    var removing = categoryState(name) === "on";
+    var targets = m.items.filter(function (it) {
+      var has = m.cats[it.id].has(name);
+      return removing ? has : !has;
+    });
+
+    state.busy = true;
+    var failed = 0;
+    for (var i = 0; i < targets.length; i++) {
+      if (state.multi === m) {
+        state.status = (removing ? "Removing from " : "Tagging ") + (i + 1) + " of " + targets.length + "…";
+        renderCategories();
+      }
+      var id = targets[i].id;
+      try {
+        await api.withItem(id, function (ops) { return removing ? ops.remove(name) : ops.add(name); });
+        if (removing) m.cats[id].delete(name); else m.cats[id].add(name);
+      } catch (e) {
+        failed++;
+      }
+    }
+    state.busy = false;
+    if (!removing && failed < targets.length) recordPick(name, total);
+    if (state.multi === m) state.status = "";
+    renderCategories();
+
+    var done = targets.length - failed;
+    if (failed) {
+      toast("Updated " + done + " of " + targets.length + " emails. " + failed + " couldn't be changed.");
+    } else if (targets.length) {
+      toast((removing ? "Removed " : "Added ") + name + (removing ? " from " : " to ") +
+        done + " email" + (done === 1 ? "" : "s") + ".");
+    }
   }
 
   // ---------- startup ----------
@@ -298,7 +473,7 @@
     state.mock = !inOutlook;
     api = state.mock ? mock : real;
     $("mode").hidden = !state.mock;
-    $("refresh").addEventListener("click", loadCategories);
+    $("refresh").addEventListener("click", function () { loadCategories().then(refreshSelection); });
 
     // Keep keyboard focus in Outlook's message list: cancelling mousedown on a
     // button stops the click from moving focus into this panel, while the click
@@ -312,12 +487,16 @@
       state.top = Array.isArray(saved.top) ? saved.top : [];
     } catch (e) { state.scores = {}; state.top = []; }
 
-    renderItem();
     await loadCategories();
+    await refreshSelection();
 
     if (!state.mock) {
       // Fires when you select a different email while the pane is pinned.
-      Office.context.mailbox.addHandlerAsync(Office.EventType.ItemChanged, onItemChanged);
+      Office.context.mailbox.addHandlerAsync(Office.EventType.ItemChanged, refreshSelection);
+      // Fires when you select several emails (Mailbox 1.13+).
+      if (Office.context.requirements.isSetSupported("Mailbox", "1.13")) {
+        Office.context.mailbox.addHandlerAsync(Office.EventType.SelectedItemsChanged, refreshSelection);
+      }
     }
   }
 

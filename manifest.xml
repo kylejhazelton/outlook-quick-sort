@@ -10,7 +10,7 @@
            xmlns:mailappor="http://schemas.microsoft.com/office/mailappversionoverrides/1.0"
            xsi:type="MailApp">
   <Id>8f3c2a71-5d4e-4b9a-9c61-2e7f0b4d13a8</Id>
-  <Version>1.0.0.0</Version>
+  <Version>1.1.0.0</Version>
   <ProviderName>Personal</ProviderName>
   <DefaultLocale>en-US</DefaultLocale>
   <DisplayName DefaultValue="Quick Sort"/>
@@ -93,10 +93,11 @@
       </bt:LongStrings>
     </Resources>
 
-    <!-- V1_1 adds SupportsPinning so the pane stays open as you move between messages. -->
+    <!-- V1_1 adds SupportsPinning (pane stays open as you move between messages)
+         and SupportsMultiSelect (works on several selected messages; Mailbox 1.13+). -->
     <VersionOverrides xmlns="http://schemas.microsoft.com/office/mailappversionoverrides/1.1" xsi:type="VersionOverridesV1_1">
       <Requirements>
-        <bt:Sets DefaultMinVersion="1.8">
+        <bt:Sets DefaultMinVersion="1.13">
           <bt:Set Name="Mailbox"/>
         </bt:Sets>
       </Requirements>
@@ -121,6 +122,7 @@
                     <Action xsi:type="ShowTaskpane">
                       <SourceLocation resid="Taskpane.Url"/>
                       <SupportsPinning>true</SupportsPinning>
+                      <SupportsMultiSelect>true</SupportsMultiSelect>
                     </Action>
                   </Control>
                 </Group>

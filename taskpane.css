@@ -104,6 +104,11 @@ button:focus-visible, input:focus-visible {
   border-color: var(--selected-border);
   font-weight: 600;
 }
+/* Some of the selected emails have this category. */
+.chip[aria-pressed="mixed"] {
+  border-color: var(--selected-border);
+  border-style: dashed;
+}
 .chip .dot {
   flex: none;
   width: 12px;
